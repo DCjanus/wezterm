@@ -1,6 +1,8 @@
+use crate::color::SrgbaTuple;
 use crate::escape::csi::{Device, Window};
+use crate::escape::osc::{ColorOrQuery, DynamicColorNumber};
 use crate::escape::parser::Parser;
-use crate::escape::{Action, DeviceControlMode, Esc, EscCode, CSI};
+use crate::escape::{Action, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI};
 use crate::terminal::ScreenSize;
 use crate::{bail, Result};
 use std::io::{Read, Write};
@@ -43,6 +45,10 @@ impl XtVersion {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::color::SrgbaTuple;
+    use crate::escape::osc::{ColorOrQuery, DynamicColorNumber, OperatingSystemCommand};
+    use std::io::Cursor;
+    use std::str::FromStr;
 
     #[test]
     fn test_xtversion_name() {
@@ -54,6 +60,70 @@ mod test {
             let version = XtVersion(input.to_string());
             assert_eq!(version.name_and_version(), result, "{input}");
         }
+    }
+
+    #[test]
+    fn test_dynamic_color() {
+        let expected = SrgbaTuple::from_str("rgb:1212/3434/5656").unwrap();
+        let response = format!(
+            "{}",
+            OperatingSystemCommand::ChangeDynamicColors(
+                DynamicColorNumber::TextForegroundColor,
+                vec![ColorOrQuery::Color(expected)],
+            )
+        );
+        let mut read = Cursor::new(response.into_bytes());
+        let mut write = vec![];
+        let mut probe = ProbeCapabilities::new(&mut read, &mut write);
+
+        let color = probe
+            .dynamic_color(DynamicColorNumber::TextForegroundColor)
+            .unwrap();
+
+        assert_eq!(color, expected);
+        assert_eq!(
+            String::from_utf8(write).unwrap(),
+            format!(
+                "{}",
+                OperatingSystemCommand::ChangeDynamicColors(
+                    DynamicColorNumber::TextForegroundColor,
+                    vec![ColorOrQuery::Query],
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn test_default_text_colors() {
+        let expected_fg = SrgbaTuple::from_str("rgb:1111/2222/3333").unwrap();
+        let expected_bg = SrgbaTuple::from_str("rgb:aaaa/bbbb/cccc").unwrap();
+        let response = format!(
+            "{}",
+            OperatingSystemCommand::ChangeDynamicColors(
+                DynamicColorNumber::TextForegroundColor,
+                vec![
+                    ColorOrQuery::Color(expected_fg),
+                    ColorOrQuery::Color(expected_bg),
+                ],
+            )
+        );
+        let mut read = Cursor::new(response.into_bytes());
+        let mut write = vec![];
+        let mut probe = ProbeCapabilities::new(&mut read, &mut write);
+
+        let colors = probe.default_text_colors().unwrap();
+
+        assert_eq!(colors, (expected_fg, expected_bg));
+        assert_eq!(
+            String::from_utf8(write).unwrap(),
+            format!(
+                "{}",
+                OperatingSystemCommand::ChangeDynamicColors(
+                    DynamicColorNumber::TextForegroundColor,
+                    vec![ColorOrQuery::Query, ColorOrQuery::Query],
+                )
+            )
+        );
     }
 }
 
@@ -82,6 +152,72 @@ impl<'a> ProbeCapabilities<'a> {
     /// of its outer terminal.
     pub fn outer_xt_version(&mut self) -> Result<XtVersion> {
         self.xt_version_impl(true)
+    }
+
+    /// Probe the terminal for the current value of a dynamic color.
+    pub fn dynamic_color(&mut self, which: DynamicColorNumber) -> Result<SrgbaTuple> {
+        let mut colors = self.dynamic_colors(which, 1)?;
+        Ok(colors.pop().expect("requested exactly one dynamic color"))
+    }
+
+    /// Probe the terminal for the default foreground and background colors.
+    pub fn default_text_colors(&mut self) -> Result<(SrgbaTuple, SrgbaTuple)> {
+        let mut colors = self.dynamic_colors(DynamicColorNumber::TextForegroundColor, 2)?;
+        let background = colors.pop().expect("requested background color");
+        let foreground = colors.pop().expect("requested foreground color");
+        Ok((foreground, background))
+    }
+
+    fn dynamic_colors(
+        &mut self,
+        first_color: DynamicColorNumber,
+        count: usize,
+    ) -> Result<Vec<SrgbaTuple>> {
+        let query = OperatingSystemCommand::ChangeDynamicColors(
+            first_color,
+            std::iter::repeat(ColorOrQuery::Query).take(count).collect(),
+        );
+        write!(self.write, "{query}")?;
+        self.write.flush()?;
+
+        let mut parser = Parser::new();
+        let mut result = None;
+
+        while result.is_none() {
+            let mut byte = [0u8];
+            if self.read.read(&mut byte)? == 0 {
+                bail!("terminal closed while waiting for dynamic color response");
+            }
+
+            parser.parse(&byte, |action| {
+                if let Action::OperatingSystemCommand(osc) = action {
+                    if let OperatingSystemCommand::ChangeDynamicColors(which, colors) = &*osc {
+                        if *which == first_color {
+                            let parsed_colors = colors
+                                .iter()
+                                .map(|color| match color {
+                                    ColorOrQuery::Color(color) => Ok(*color),
+                                    ColorOrQuery::Query => {
+                                        bail!("terminal returned an incomplete dynamic color response")
+                                    }
+                                })
+                                .collect::<Result<Vec<_>>>();
+                            result = Some(parsed_colors);
+                        }
+                    }
+                }
+            });
+        }
+
+        let colors = result.expect("loop exits after parsing a response")?;
+        if colors.len() != count {
+            bail!(
+                "expected {count} dynamic colors starting at {:?}, got {}",
+                first_color,
+                colors.len()
+            );
+        }
+        Ok(colors)
     }
 
     fn xt_version_impl(&mut self, tmux_escape: bool) -> Result<XtVersion> {
